@@ -10,7 +10,7 @@ def _get():
         with _lock:
             if _model is None:
                 dev=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-                m,_=torch.hub.load('snakers4/silero-models','silero_tts',language='ru',speaker='v4_ru')
+                m,_=torch.hub.load('snakers4/silero-models','silero_tts',language='ru',speaker='v4_ru',trust_repo=True)
                 m.to(dev); _model=m
     return _model
 
