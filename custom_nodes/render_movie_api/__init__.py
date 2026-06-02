@@ -32,6 +32,12 @@ def _resolve(filename, subfolder, ftype):
     return None
 
 
+def _download(url, dst):
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'})
+    with urllib.request.urlopen(req, timeout=90) as r, open(dst, 'wb') as f:
+        f.write(r.read())
+
+
 def _has_audio(path):
     try:
         r = subprocess.run(
@@ -96,26 +102,30 @@ async def _render_movie(req):
         for i, s in enumerate(scenes):
             dst = os.path.join(work, 'n%03d.ts' % i)
             typ = (s.get('type') or 'video').lower()
-            if typ == 'video':
-                src = _resolve(s.get('filename') or s.get('file') or '',
-                               s.get('subfolder') or '',
-                               s.get('ftype') or s.get('typ') or 'temp')
-                if not src:
-                    errors.append('scene %d: clip not found: %s' % (i, s.get('filename')))
-                    continue
-                _norm_video(src, dst, W, H, FPS)
-            else:
-                img = s.get('image_url') or s.get('image') or s.get('file') or ''
-                local = img
-                if isinstance(img, str) and img.startswith('http'):
-                    local = os.path.join(work, 'img%03d' % i)
-                    urllib.request.urlretrieve(img, local)
-                if not local or not os.path.exists(local):
-                    errors.append('scene %d: still image missing' % i)
-                    continue
-                sec = float(s.get('sec') or s.get('duration') or 6)
-                _norm_still(local, dst, sec, W, H, FPS)
-            parts.append(dst)
+            try:
+                if typ == 'video':
+                    src = _resolve(s.get('filename') or s.get('file') or '',
+                                   s.get('subfolder') or '',
+                                   s.get('ftype') or s.get('typ') or 'temp')
+                    if not src:
+                        errors.append('scene %d: clip not found: %s' % (i, s.get('filename')))
+                        continue
+                    _norm_video(src, dst, W, H, FPS)
+                else:
+                    img = s.get('image_url') or s.get('image') or s.get('file') or ''
+                    local = img
+                    if isinstance(img, str) and img.startswith('http'):
+                        local = os.path.join(work, 'img%03d' % i)
+                        _download(img, local)
+                    if not local or not os.path.exists(local):
+                        errors.append('scene %d: still image missing' % i)
+                        continue
+                    sec = float(s.get('sec') or s.get('duration') or 6)
+                    _norm_still(local, dst, sec, W, H, FPS)
+                parts.append(dst)
+            except Exception as se:
+                errors.append('scene %d (%s) skipped: %s' % (i, typ, str(se)[:160]))
+                continue
 
         if not parts:
             return web.json_response({'error': 'no_renderable_scenes', 'details': errors}, status=500)
