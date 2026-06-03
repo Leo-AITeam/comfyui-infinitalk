@@ -8,12 +8,27 @@ OUTPUT = os.path.join(ROOT, 'output')
 TEMP = os.path.join(ROOT, 'temp')
 INPUT = os.path.join(ROOT, 'input')
 
-VF = ("scale=%d:%d:force_original_aspect_ratio=decrease,"
-      "pad=%d:%d:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=%d,format=yuv420p")
+
+def _find_font():
+    cands = ['/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+             '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+             '/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf']
+    for p in cands:
+        if os.path.isfile(p):
+            return p
+    try:
+        for r, _, fs in os.walk('/usr/share/fonts'):
+            for f in fs:
+                if f.lower().endswith('.ttf'):
+                    return os.path.join(r, f)
+    except Exception:
+        pass
+    return None
+
+FONT = _find_font()
 
 
 def _resolve(filename, subfolder, ftype):
-    """Find a clip file produced by ComfyUI (output/temp/input)."""
     if not filename:
         return None
     bases = [OUTPUT, TEMP, INPUT]
@@ -49,8 +64,52 @@ def _has_audio(path):
         return False
 
 
-def _norm_video(src, dst, W, H, FPS):
-    vf = VF % (W, H, W, H, FPS)
+def _wrap(text, maxc=22, maxl=3):
+    words = str(text).split()
+    lines = []
+    cur = ''
+    for w in words:
+        if len(cur) + len(w) + (1 if cur else 0) <= maxc:
+            cur = (cur + ' ' + w).strip()
+        else:
+            if cur:
+                lines.append(cur)
+            cur = w
+            if len(lines) >= maxl:
+                break
+    if cur and len(lines) < maxl:
+        lines.append(cur)
+    lines = lines[:maxl]
+    used = ' '.join(lines)
+    if len(used) < len(' '.join(words)):
+        lines[-1] = lines[-1] + '...'
+    return '\n'.join(lines)
+
+
+def _sub_filter(text, work, idx, W, H):
+    """Build a drawtext filter for a caption, or '' if none/unsupported."""
+    if not text or not FONT:
+        return ''
+    txt = _wrap(text)
+    if not txt.strip():
+        return ''
+    tf = os.path.join(work, 'sub%03d.txt' % idx)
+    with open(tf, 'w') as f:
+        f.write(txt)
+    fs = max(34, H // 30)
+    return ("drawtext=fontfile=%s:textfile=%s:fontcolor=white:fontsize=%d:"
+            "box=1:boxcolor=black@0.5:boxborderw=16:line_spacing=8:"
+            "x=(w-text_w)/2:y=h-text_h-%d") % (FONT, tf, fs, int(H * 0.10))
+
+
+def _vf_base(W, H, FPS):
+    return ("scale=%d:%d:force_original_aspect_ratio=decrease,"
+            "pad=%d:%d:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=%d") % (W, H, W, H, FPS)
+
+
+def _norm_video(src, dst, W, H, FPS, text=''):
+    sub = _sub_filter(text, os.path.dirname(dst), abs(hash(dst)) % 1000, W, H)
+    vf = _vf_base(W, H, FPS) + ((',' + sub) if sub else '') + ',format=yuv420p'
     enc = ['-r', str(FPS), '-c:v', 'libx264', '-preset', 'veryfast',
            '-crf', '20', '-pix_fmt', 'yuv420p',
            '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-f', 'mpegts', dst]
@@ -63,30 +122,41 @@ def _norm_video(src, dst, W, H, FPS):
     subprocess.run(cmd, check=True, capture_output=True, timeout=900)
 
 
-def _norm_still(src, dst, sec, W, H, FPS):
-    vf = VF % (W, H, W, H, FPS)
-    cmd = ['ffmpeg', '-y', '-loop', '1', '-t', str(sec), '-i', src,
+def _norm_still(src, dst, sec, W, H, FPS, text=''):
+    """Ken Burns slow zoom on a still (+ optional caption) -> mpegts segment."""
+    sec = max(1.0, float(sec))
+    frames = int(round(sec * FPS))
+    sub = _sub_filter(text, os.path.dirname(dst), abs(hash(dst)) % 1000, W, H)
+    kb = ("scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d,"
+          "zoompan=z='min(zoom+0.0010,1.18)':d=%d:"
+          "x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=%dx%d:fps=%d,setsar=1") % (
+              W, H, W, H, frames, W, H, FPS)
+    vf = kb + ((',' + sub) if sub else '') + ',format=yuv420p'
+    cmd = ['ffmpeg', '-y', '-i', src,
            '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
-           '-vf', vf, '-shortest',
-           '-r', str(FPS), '-c:v', 'libx264', '-preset', 'veryfast',
-           '-crf', '20', '-pix_fmt', 'yuv420p',
+           '-vf', vf, '-t', str(sec), '-r', str(FPS),
+           '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
            '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-f', 'mpegts', dst]
-    subprocess.run(cmd, check=True, capture_output=True, timeout=300)
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, timeout=600)
+    except subprocess.CalledProcessError:
+        # Fallback: static still (no Ken Burns) if zoompan fails on the host ffmpeg
+        vf2 = _vf_base(W, H, FPS) + ((',' + sub) if sub else '') + ',format=yuv420p'
+        cmd2 = ['ffmpeg', '-y', '-loop', '1', '-t', str(sec), '-i', src,
+                '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
+                '-vf', vf2, '-shortest', '-r', str(FPS),
+                '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
+                '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-f', 'mpegts', dst]
+        subprocess.run(cmd2, check=True, capture_output=True, timeout=300)
 
 
 @PromptServer.instance.routes.post('/render_movie')
 async def _render_movie(req):
-    """Assemble talking-head clips (+ still scenes) into one vertical mp4 via ffmpeg.
+    """Assemble talking-head clips (+ Ken Burns still scenes, + captions) into one vertical mp4.
 
-    Body: {
-      width, height, fps,
-      output: "movie_x.mp4",
-      scenes: [
-        {"type":"video","filename":"WanVideo_x.mp4","subfolder":"","ftype":"temp"},
-        {"type":"still","image_url":"https://...jpg","sec":12}
-      ]
-    }
-    Returns {filename, subfolder, type:"output", scenes, errors} or {error,...}.
+    Body: { width, height, fps, output, scenes: [
+        {"type":"video","filename":"..","subfolder":"","ftype":"temp","text":"caption"},
+        {"type":"still","image_url":"https://..jpg","sec":6,"text":"caption"} ] }
     """
     try:
         d = await req.json()
@@ -102,6 +172,7 @@ async def _render_movie(req):
         for i, s in enumerate(scenes):
             dst = os.path.join(work, 'n%03d.ts' % i)
             typ = (s.get('type') or 'video').lower()
+            text = s.get('text') or s.get('caption') or ''
             try:
                 if typ == 'video':
                     src = _resolve(s.get('filename') or s.get('file') or '',
@@ -110,7 +181,7 @@ async def _render_movie(req):
                     if not src:
                         errors.append('scene %d: clip not found: %s' % (i, s.get('filename')))
                         continue
-                    _norm_video(src, dst, W, H, FPS)
+                    _norm_video(src, dst, W, H, FPS, text)
                 else:
                     img = s.get('image_url') or s.get('image') or s.get('file') or ''
                     local = img
@@ -121,7 +192,7 @@ async def _render_movie(req):
                         errors.append('scene %d: still image missing' % i)
                         continue
                     sec = float(s.get('sec') or s.get('duration') or 6)
-                    _norm_still(local, dst, sec, W, H, FPS)
+                    _norm_still(local, dst, sec, W, H, FPS, text)
                 parts.append(dst)
             except Exception as se:
                 errors.append('scene %d (%s) skipped: %s' % (i, typ, str(se)[:160]))
