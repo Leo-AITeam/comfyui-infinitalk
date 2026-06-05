@@ -88,6 +88,7 @@ def _wrap(text, maxc=22, maxl=3):
 
 def _sub_filter(text, work, idx, W, H):
     """Build a drawtext filter for a caption, or '' if none/unsupported."""
+    return ''  # subtitles disabled: no burned-in captions (per requirement)
     if not text or not FONT:
         return ''
     txt = _wrap(text)
